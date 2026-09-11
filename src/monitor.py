@@ -14,7 +14,7 @@ DATA_DIR = ROOT / "data"
 LATEST_FILE = DATA_DIR / "latest.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 
-SEAGM_URL = "https://www.seagm.com/zh/itunes-gift-card-turkey"
+SEAGM_URL = "https://www.seagm.com/zh-cn/itunes-gift-card-united-states"
 FRANKFURTER_URL = "https://api.frankfurter.app/latest?from=USD&to=CNY"
 ER_API_URL = "https://open.er-api.com/v6/latest/USD"
 
@@ -58,26 +58,36 @@ def fetch_html() -> str:
 
 
 def parse_products(html: str) -> list[dict[str, float | int | str]]:
-    """从页面可见文本提取形如 'iTunes Gift Card 1000 TL TR US$ 22.45' 的商品。"""
+    """从美国区商品页的 SKU 列表提取面额、原价和折后售价。"""
     soup = BeautifulSoup(html, "html.parser")
-    text = " ".join(soup.stripped_strings)
+    products: dict[float, dict[str, float | int | str]] = {}
 
-    pattern = re.compile(
-        r"iTunes\s+Gift\s+Card\s+([\d,]+)\s+TL\s+TR"
-        r".{0,180}?US\$\s*([\d,.]+)",
-        flags=re.IGNORECASE,
-    )
-
-    products: dict[int, dict[str, float | int | str]] = {}
-    for face_raw, price_raw in pattern.findall(text):
-        face_value = int(face_raw.replace(",", ""))
-        price_usd = float(price_raw.replace(",", ""))
-        if face_value <= 0 or price_usd <= 0:
+    for sku in soup.select("#cardType .SKU_type"):
+        name_node = sku.select_one(".sku span")
+        original_node = sku.select_one(".price_origional")
+        sale_node = sku.select_one(".price_discount") or original_node
+        if not name_node or not original_node or not sale_node:
             continue
+
+        name = name_node.get_text(" ", strip=True)
+        face_match = re.search(r"([\d,.]+)\s*(?:USD|美金)", name, re.IGNORECASE)
+        original_match = re.search(r"US\$\s*([\d,.]+)", original_node.get_text(" ", strip=True))
+        sale_match = re.search(r"US\$\s*([\d,.]+)", sale_node.get_text(" ", strip=True))
+        if not face_match or not original_match or not sale_match:
+            continue
+
+        face_value = float(face_match.group(1).replace(",", ""))
+        list_price_usd = float(original_match.group(1).replace(",", ""))
+        price_usd = float(sale_match.group(1).replace(",", ""))
+        if face_value <= 0 or list_price_usd <= 0 or price_usd <= 0:
+            continue
+
+        face_key: float | int = int(face_value) if face_value.is_integer() else face_value
         products[face_value] = {
-            "face_value_try": face_value,
+            "face_value_usd": face_key,
+            "list_price_usd": round(list_price_usd, 4),
             "price_usd": round(price_usd, 4),
-            "product_name": f"iTunes Gift Card {face_value} TL TR",
+            "product_name": f"iTunes Gift Card {face_key} USD US",
         }
 
     result = [products[key] for key in sorted(products)]
@@ -129,14 +139,14 @@ def normalize_products(
 ) -> list[dict[str, float | int | str]]:
     normalized = []
     for product in products:
-        face_value = int(product["face_value_try"])
+        face_value = float(product["face_value_usd"])
         price_usd = float(product["price_usd"])
         price_cny = price_usd * usd_cny
         normalized.append(
             {
                 **product,
                 "price_cny": round(price_cny, 2),
-                "cny_per_100_try": round(price_cny / face_value * 100, 3),
+                "cny_per_usd_value": round(price_cny / face_value, 4),
             }
         )
     return normalized
@@ -145,7 +155,7 @@ def normalize_products(
 def append_history(snapshot: dict[str, Any]) -> None:
     history = read_json(HISTORY_FILE, {"snapshots": []})
     snapshots = history.get("snapshots")
-    if not isinstance(snapshots, list):
+    if history.get("region") != snapshot["source"]["region"] or not isinstance(snapshots, list):
         snapshots = []
 
     snapshots.append(
@@ -154,10 +164,11 @@ def append_history(snapshot: dict[str, Any]) -> None:
             "usd_cny": snapshot["exchange_rate"]["usd_cny"],
             "products": [
                 {
-                    "face_value_try": item["face_value_try"],
+                    "face_value_usd": item["face_value_usd"],
+                    "list_price_usd": item["list_price_usd"],
                     "price_usd": item["price_usd"],
                     "price_cny": item["price_cny"],
-                    "cny_per_100_try": item["cny_per_100_try"],
+                    "cny_per_usd_value": item["cny_per_usd_value"],
                 }
                 for item in snapshot["products"]
             ],
@@ -178,6 +189,7 @@ def append_history(snapshot: dict[str, Any]) -> None:
     write_json(
         HISTORY_FILE,
         {
+            "region": snapshot["source"]["region"],
             "retention_days": 60,
             "snapshots": retained,
         },
@@ -197,7 +209,7 @@ def main() -> None:
         "source": {
             "name": "SEAGM",
             "url": SEAGM_URL,
-            "region": "TR",
+            "region": "US",
         },
         "exchange_rate": {
             "usd_cny": round(usd_cny, 6),
@@ -215,12 +227,12 @@ def main() -> None:
     write_json(LATEST_FILE, latest)
     append_history(latest)
 
-    best = min(products, key=lambda item: float(item["cny_per_100_try"]))
+    best = min(products, key=lambda item: float(item["cny_per_usd_value"]))
     print(f"抓取成功：{len(products)} 个面额")
     print(f"USD/CNY: {usd_cny:.4f} ({fx_source})")
     print(
         "当前单位成本最低："
-        f"{best['face_value_try']} TRY / ¥{best['cny_per_100_try']} per 100 TRY"
+        f"{best['face_value_usd']} USD / ¥{best['cny_per_usd_value']} per USD"
     )
 
 
